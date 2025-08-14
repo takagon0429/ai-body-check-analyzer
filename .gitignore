@@ -13,3 +13,11 @@ venv/
 dist/
 build/
 *.egg-info/
+
+# ignore rich text
+*.rtf
+
+# venv
+.venv/
+.venv311/
+venv/
