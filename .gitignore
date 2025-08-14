@@ -21,3 +21,8 @@ build/
 .venv/
 .venv311/
 venv/
+
+# venv
+.venv/
+.venv311/
+venv/
