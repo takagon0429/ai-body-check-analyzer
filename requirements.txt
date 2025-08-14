@@ -5,3 +5,4 @@ mediapipe==0.10.14
 
 # WSGI server for Render
 gunicorn==22.0.0
+requests
