@@ -521,7 +521,7 @@ def analyze():
     front_metrics, side_metrics = _front_side_metrics_from_pose(
         front_pose, side_pose, cm_per_px, f_front, f_side
     )
-        body_fat = fatness_estimate(front_arr, side_arr)
+    body_fat = fatness_estimate(front_arr, side_arr)
 
     return jsonify({
         "status": "ok",
