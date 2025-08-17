@@ -6,6 +6,175 @@ import cv2
 from PIL import Image, ImageOps
 from flask import Flask, request, jsonify
 
+# ==== ここから追記（脂肪傾向推定）========================
+import math
+import mediapipe as mp
+
+mp_pose = mp.solutions.pose
+
+def _pose_landmarks(arr_rgb):
+    """RGB(ndarray) -> mediapipe pose landmarks or None"""
+    with mp_pose.Pose(static_image_mode=True, model_complexity=0, enable_segmentation=False) as pose:
+        res = pose.process(arr_rgb)
+    if not res.pose_landmarks:
+        return None
+    h, w = arr_rgb.shape[:2]
+    pts = []
+    for lm in res.pose_landmarks.landmark:
+        pts.append((lm.x * w, lm.y * h, lm.visibility))
+    return pts  # [(x,y,vis), ...]
+
+def _safe_dist(p1, p2):
+    if not p1 or not p2: return None
+    return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
+
+def _pick(pts, idx):
+    """取れなければ None"""
+    if pts is None: return None
+    if idx >= len(pts): return None
+    x,y,v = pts[idx]
+    return (x,y) if v is None or v > 0.3 else None
+
+# Mediapipe の主要インデックス（BlazePose）
+POSE = {
+    "L_SHO": 11, "R_SHO": 12,
+    "L_HIP": 23, "R_HIP": 24,
+    "L_KNEE": 25, "R_KNEE": 26,
+}
+
+def _width_at_y(binary_mask, y_row):
+    """あるYでのシルエット横幅(ピクセル)を返す。なければ0"""
+    H, W = binary_mask.shape[:2]
+    y = min(max(int(y_row), 0), H-1)
+    row = binary_mask[y, :]
+    xs = np.where(row > 0)[0]
+    if xs.size == 0:
+        return 0
+    return int(xs.max() - xs.min() + 1)
+
+def _person_silhouette(arr_rgb):
+    """簡易シルエット（二値マスク）: 人物領域をザックリ抽出"""
+    import cv2
+    gray = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
+    # 平滑化→Canny→膨張→穴埋めで最大輪郭
+    blur = cv2.GaussianBlur(gray, (5,5), 0)
+    edges = cv2.Canny(blur, 50, 150)
+    kernel = np.ones((5,5), np.uint8)
+    dil = cv2.dilate(edges, kernel, iterations=2)
+    cnts, _ = cv2.findContours(dil, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    mask = np.zeros_like(gray)
+    if len(cnts) == 0:
+        return (mask > 0).astype(np.uint8)
+    c = max(cnts, key=cv2.contourArea)
+    cv2.drawContours(mask, [c], -1, 255, thickness=cv2.FILLED)
+    return (mask > 0).astype(np.uint8)
+
+def _fatness_from_front(arr_rgb):
+    """
+    正面画像から肩幅/腰幅/臀部幅 → WSR/WHR を作る。
+    ランドマークが取れなければシルエット幅で代替。
+    """
+    H, W = arr_rgb.shape[:2]
+    pts = _pose_landmarks(arr_rgb)
+    sil = _person_silhouette(arr_rgb)
+
+    # 肩・腰・ヒップのY位置の見立て（ランドマーク優先、無ければ比率）
+    L_SHO = _pick(pts, POSE["L_SHO"]); R_SHO = _pick(pts, POSE["R_SHO"])
+    L_HIP = _pick(pts, POSE["L_HIP"]); R_HIP = _pick(pts, POSE["R_HIP"])
+
+    y_shoulder = None
+    if L_SHO and R_SHO: y_shoulder = (L_SHO[1] + R_SHO[1]) / 2
+    y_hip = None
+    if L_HIP and R_HIP: y_hip = (L_HIP[1] + R_HIP[1]) / 2
+
+    if y_shoulder is None: y_shoulder = H * 0.22
+    if y_hip is None: y_hip = H * 0.55
+    y_waist = (y_shoulder * 0.3 + y_hip * 0.7)  # 肩とヒップの間のやや下＝“ウエスト”
+
+    shoulder_w = _width_at_y(sil, y_shoulder)
+    waist_w    = _width_at_y(sil, y_waist)
+    hip_w      = _width_at_y(sil, y_hip)
+
+    # 正規化（画像サイズ依存を弱める）
+    norm = max(1, int(W * 0.1))
+    shoulder_w_n = shoulder_w / norm
+    waist_w_n    = waist_w / norm
+    hip_w_n      = hip_w / norm
+
+    # 指標
+    WSR = waist_w / max(1, shoulder_w)  # Waist-to-Shoulder
+    WHR = waist_w / max(1, hip_w)       # Waist-to-Hip
+
+    # スコア化（0=痩せ〜10=脂肪多め：経験則レンジ）
+    def clamp01(x): return max(0.0, min(1.0, x))
+    wsr_score = clamp01((WSR - 0.70) / (0.20))   # 0.70→0, 0.90→1
+    whr_score = clamp01((WHR - 0.80) / (0.25))   # 0.80→0, 1.05→1
+    fat_score_front = (wsr_score*0.6 + whr_score*0.4) * 10.0
+
+    return {
+        "shoulder_px": shoulder_w, "waist_px": waist_w, "hip_px": hip_w,
+        "WSR": round(WSR, 3), "WHR": round(WHR, 3),
+        "score_front": round(fat_score_front, 1),
+    }
+
+def _fatness_from_side(arr_rgb):
+    """
+    側面画像から腹部の前方突出・首/骨盤ラインの傾きで脂肪傾向を補正。
+    """
+    H, W = arr_rgb.shape[:2]
+    pts = _pose_landmarks(arr_rgb)
+    sil = _person_silhouette(arr_rgb)
+
+    # ヒップY近辺の縦帯で“お腹の突出”を測る：上半身中腹の横幅 - 胸側の基準
+    # 胸（肩）〜腰の中点を腹部Yとみなす
+    L_SHO = _pick(pts, POSE["L_SHO"]); R_SHO = _pick(pts, POSE["R_SHO"])
+    L_HIP = _pick(pts, POSE["L_HIP"]); R_HIP = _pick(pts, POSE["R_HIP"])
+    y_shoulder = (L_SHO[1]+R_SHO[1])/2 if (L_SHO and R_SHO) else H*0.22
+    y_hip      = (L_HIP[1]+R_HIP[1])/2 if (L_HIP and R_HIP) else H*0.60
+    y_abdomen  = (y_shoulder*0.2 + y_hip*0.8)
+
+    # 腹部横幅（シルエット幅）
+    abd_w = _width_at_y(sil, y_abdomen)
+
+    # 体高で正規化
+    body_top = np.argmax(sil.any(axis=1))                      # 最初にTrueの行
+    body_bot = sil.shape[0] - 1 - np.argmax(sil[::-1].any(axis=1))
+    body_h   = max(1, body_bot - body_top + 1)
+    abd_ratio = abd_w / max(1, body_h)  # 身長比の腹部幅
+
+    # スコア（0→10）
+    # 0.20以下：スリム、0.35以上：突出気味という仮レンジ
+    def clamp01(x): return max(0.0, min(1.0, x))
+    abd_score = clamp01((abd_ratio - 0.20) / (0.15)) * 10.0
+
+    return {
+        "abdomen_width_px": int(abd_w),
+        "abdomen_ratio": round(abd_ratio, 3),
+        "score_side": round(abd_score, 1),
+    }
+
+def fatness_estimate(front_rgb, side_rgb):
+    """前面+側面から総合“脂肪傾向スコア”を0〜10で返す"""
+    fr = _fatness_from_front(front_rgb)
+    sd = _fatness_from_side(side_rgb)
+    # 前面6:側面4の重み
+    score = fr["score_front"] * 0.6 + sd["score_side"] * 0.4
+
+    # クラス分類
+    if score < 3.0: klass = "痩せ傾向"
+    elif score < 6.0: klass = "標準"
+    elif score < 8.0: klass = "やや脂肪多め"
+    else: klass = "脂肪多め"
+
+    return {
+        "score": round(score, 1),
+        "class": klass,
+        "front": fr,
+        "side": sd,
+    }
+# ==== ここまで追記 ======================================
+
+
 # ========= 可用なら MediaPipe を使う（無ければ自動フォールバック）=========
 try:
     import mediapipe as mp
@@ -352,6 +521,19 @@ def analyze():
     front_metrics, side_metrics = _front_side_metrics_from_pose(
         front_pose, side_pose, cm_per_px, f_front, f_side
     )
+        body_fat = fatness_estimate(front_arr, side_arr)
+
+    return jsonify({
+        "status": "ok",
+        "message": "files received",
+        "scores": scores,
+        "front_metrics": front_metrics,
+        "side_metrics": side_metrics,
+        "body_fat": body_fat,  # ★ 追加項目
+        "advice": advice,
+        "front_filename": request.files["front"].filename,
+        "side_filename": request.files["side"].filename,
+    })
 
     # スコア
     scores = _score_from_feats(f_front, f_side, quality=quality)
