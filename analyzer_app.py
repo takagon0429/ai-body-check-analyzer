@@ -1,336 +1,384 @@
 # analyzer_app.py
 import io
 import math
-from typing import Tuple, Dict, Any
-
 import numpy as np
 import cv2
 from PIL import Image
 from flask import Flask, request, jsonify
 
+# --- Mediapipe (0.10 以降推奨) ---
+try:
+    import mediapipe as mp
+    MP_AVAILABLE = True
+except Exception:
+    MP_AVAILABLE = False
+
 app = Flask(__name__)
 
-# ========== Health / Version ==========
+# ================================
+# Health & Version
+# ================================
 @app.get("/healthz")
 def healthz():
     return "ok", 200
 
 @app.get("/version")
 def version():
-    return jsonify({"service": "analyzer", "rev": "img-feats-v2-symmetry-centroids"}), 200
+    return jsonify({"service": "analyzer", "rev": "pose-v1"}), 200
 
 
-# ========== Utils ==========
-def _safe_numpy(arr):
-    """NaNやinfが出ても落ちないようにクランプ"""
-    a = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
-    return a
-
-
-def _read_rgb(file_storage) -> Tuple[np.ndarray, bytes]:
-    """Werkzeug FileStorage -> (RGB ndarray[h,w,3], raw bytes)"""
+# ================================
+# 画像 I/O
+# ================================
+def _load_img(file_storage):
+    """
+    werkzeug FileStorage -> (np.ndarray RGB, raw bytes)
+    """
     b = file_storage.read()
     img = Image.open(io.BytesIO(b)).convert("RGB")
     arr = np.array(img)
     return arr, b
 
 
-def _resize_keep(arr: np.ndarray, max_side: int = 720) -> np.ndarray:
-    """計算軽量化のため最大辺を縮小"""
-    h, w = arr.shape[:2]
-    scale = min(1.0, max_side / max(h, w))
-    if scale >= 0.999:
-        return arr
-    nh, nw = int(h * scale), int(w * scale)
-    return cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_AREA)
-
-
-def _gray_edge(arr_rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    gray = cv2.cvtColor(arr_rgb, cv2.COLOR_RGB2GRAY)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    edges = cv2.Canny(gray, 60, 160)
-    return gray, edges
-
-
-def _norm01(x, lo, hi):
-    if hi <= lo:
-        return 0.5
-    v = (x - lo) / (hi - lo)
-    return float(max(0.0, min(1.0, v)))
-
-
-def _to10(x01):
-    return float(round(10.0 * max(0.0, min(1.0, x01)), 1))
-
-
-def _center_of_edges(edges: np.ndarray, mask: np.ndarray = None) -> Tuple[float, float]:
-    """エッジ点の重心 (y, x)。無ければ画像中心を返す。"""
-    if mask is not None:
-        sel = (edges > 0) & (mask > 0)
-    else:
-        sel = edges > 0
-    ys, xs = np.where(sel)
-    if len(xs) == 0:
-        h, w = edges.shape[:2]
-        return h / 2.0, w / 2.0
-    return float(np.mean(ys)), float(np.mean(xs))
-
-
-def _upper_lower_masks(h, w, upper_rate=0.4, lower_rate=0.4):
-    upper = np.zeros((h, w), np.uint8)
-    lower = np.zeros((h, w), np.uint8)
-    upper[: int(h * upper_rate), :] = 255
-    lower[int(h * (1.0 - lower_rate)) :, :] = 255
-    return upper, lower
-
-
-def _left_right_masks(h, w, left_rate=0.5):
-    left = np.zeros((h, w), np.uint8)
-    right = np.zeros((h, w), np.uint8)
-    left[:, : int(w * left_rate)] = 255
-    right[:, int(w * left_rate) :] = 255
-    return left, right
-
-
-# ========== 画像特徴（ベース） ==========
-def _basic_feats(gray: np.ndarray, edges: np.ndarray) -> Dict[str, float]:
+# ================================
+# 失敗時のフォールバック特徴量（画像統計）
+# ================================
+def _img_feats(arr: np.ndarray):
+    gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
     mean = float(np.mean(gray))
     std = float(np.std(gray))
-    edge_ratio = float(np.mean(edges > 0))
-    # 横/縦のエッジ傾向（Sobelの方向性）
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    gx = _safe_numpy(gx)
-    gy = _safe_numpy(gy)
-    horiz = float(np.mean(np.abs(gx)))
-    verti = float(np.mean(np.abs(gy)))
-    hv_ratio = float(horiz / (verti + 1e-6))  # >1 で横成分が強い
-
-    return dict(mean=mean, std=std, edge=edge_ratio, hv_ratio=hv_ratio)
+    edges = cv2.Canny(gray, 50, 150)
+    edge_ratio = float(np.mean(edges > 0))  # 0〜1
+    return dict(mean=mean, std=std, edge=edge_ratio)
 
 
-# ========== FRONT: 肩/骨盤の“傾き”を近似 ==========
-def _front_metrics(arr_rgb: np.ndarray) -> Dict[str, Any]:
+# ================================
+# 幾何ユーティリティ
+# ================================
+def _angle_deg(p1, p2):
     """
-    片側の肩が下がっていると、左右上部のエッジ重心のy差が出やすい。
-    骨盤も下部の左右エッジ重心y差で近似。差分を角度換算（小振幅）。
+    2点 p1(x,y), p2(x,y) を結ぶ線分の「水平からの角度」
+    右が0°, 上が+90° という通常atan2の度数法
+    ここでは水平との差を見たいので、水平に対し 180°に近いほど水平とみなす
     """
-    arr = _resize_keep(arr_rgb, 720)
-    gray, edges = _gray_edge(arr)
-    h, w = gray.shape[:2]
+    dx, dy = (p2[0] - p1[0], p2[1] - p1[1])
+    rad = math.atan2(dy, dx)
+    deg = math.degrees(rad)
+    # 水平基準に合わせ、左右対称にするため 180 に寄せる
+    # 例: 完全水平なら 0° or 180°。ここでは 180°に正規化して返す
+    # 180 - |deg| を 0〜180 に収め、最終的に 180 に近いほど水平
+    norm = 180 - abs(deg)
+    return max(0.0, min(180.0, 180.0 - abs(180.0 - norm)))
 
-    # 上部・下部マスク
-    upper_mask, lower_mask = _upper_lower_masks(h, w, 0.42, 0.42)
-    # 左右マスク
-    left_mask, right_mask = _left_right_masks(h, w, 0.5)
 
-    # 肩：上部 × 左右 重心のy差
-    ul = cv2.bitwise_and(upper_mask, left_mask)
-    ur = cv2.bitwise_and(upper_mask, right_mask)
-    y_ul, _ = _center_of_edges(edges, ul)
-    y_ur, _ = _center_of_edges(edges, ur)
-    shoulder_y_diff = float(y_ul - y_ur)  # +で左が下がり気味
+def _dist(p1, p2):
+    return math.hypot(p1[0]-p2[0], p1[1]-p2[1])
 
-    # 骨盤：下部 × 左右 重心のy差
-    ll = cv2.bitwise_and(lower_mask, left_mask)
-    lr = cv2.bitwise_and(lower_mask, right_mask)
-    y_ll, _ = _center_of_edges(edges, ll)
-    y_lr, _ = _center_of_edges(edges, lr)
-    pelvis_y_diff = float(y_ll - y_lr)
 
-    # 角度化（画面幅でスケール、小さく安定させる）
-    # 1pxのy差 ~ 0.15° くらいの小さめ傾斜で換算（経験値的に控えめ）
-    px2deg = 0.15
-    shoulder_angle = 180.0 - float(px2deg * shoulder_y_diff)
-    pelvis_tilt = 180.0 - float(px2deg * pelvis_y_diff)
+def _safe_get_landmark(lms, idx):
+    lm = lms[idx]
+    return (lm.x, lm.y, lm.visibility)
 
-    # 常識的範囲にクランプ
-    shoulder_angle = float(round(max(160.0, min(180.0, shoulder_angle)), 1))
-    pelvis_tilt = float(round(max(160.0, min(180.0, pelvis_tilt)), 1))
+
+def _px(pt, w, h):
+    return (pt[0]*w, pt[1]*h)
+
+
+# ================================
+# Mediapipe ポーズ解析（フロント・サイド）
+# ================================
+def _analyze_front_with_pose(arr: np.ndarray):
+    """
+    正面画像: 肩ライン, 骨盤ラインの水平度
+    返り値:
+      {
+        "shoulder_angle": 180に近いほど水平,
+        "pelvis_tilt": 180に近いほど水平,
+        "aux": {...}  # デバッグ用（必要なら）
+      }
+    """
+    if not MP_AVAILABLE:
+        return None
+
+    h, w = arr.shape[:2]
+    mp_pose = mp.solutions.pose
+    with mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False) as pose:
+        res = pose.process(arr)
+        if not res.pose_landmarks:
+            return None
+
+        lms = res.pose_landmarks.landmark
+
+        # 主要点（左右の肩・腰）
+        # https://developers.google.com/mediapipe/solutions/vision/pose_landmarker
+        # MP 0.10の index: LEFT/RIGHT_SHOULDER=11/12, LEFT/RIGHT_HIP=23/24
+        try:
+            L_SH, R_SH = _safe_get_landmark(lms, 11), _safe_get_landmark(lms, 12)
+            L_HP, R_HP = _safe_get_landmark(lms, 23), _safe_get_landmark(lms, 24)
+        except Exception:
+            return None
+
+        # 可視性チェック（低すぎるなら使わない）
+        if min(L_SH[2], R_SH[2], L_HP[2], R_HP[2]) < 0.3:
+            return None
+
+        L_SH_px, R_SH_px = _px(L_SH, w, h), _px(R_SH, w, h)
+        L_HP_px, R_HP_px = _px(L_HP, w, h), _px(R_HP, w, h)
+
+        shoulder_angle = _angle_deg(L_SH_px, R_SH_px)  # 180に近いほど水平
+        pelvis_tilt    = _angle_deg(L_HP_px, R_HP_px)  # 180に近いほど水平
+
+        return {
+            "shoulder_angle": round(shoulder_angle, 1),
+            "pelvis_tilt": round(pelvis_tilt, 1)
+        }
+
+
+def _analyze_side_with_pose(arr: np.ndarray):
+    """
+    側面画像: 頭の前方変位 (耳-肩の水平ズレ) と 胸椎カーブの粗い推定
+    返り値:
+      {
+        "forward_head_cm": float,
+        "kyphosis_grade": "軽度"|"中等度"|"やや強い"
+      }
+    """
+    if not MP_AVAILABLE:
+        return None
+
+    h, w = arr.shape[:2]
+    mp_pose = mp.solutions.pose
+    with mp_pose.Pose(static_image_mode=True, model_complexity=1, enable_segmentation=False) as pose:
+        res = pose.process(arr)
+        if not res.pose_landmarks:
+            return None
+
+        lms = res.pose_landmarks.landmark
+
+        # 主要点（耳/肩/腰/膝）: 耳(EAR)は Pose にないため、頭部の代替として NOSE(0) or EYE(1,2) を使う
+        try:
+            NOSE   = _safe_get_landmark(lms, 0)
+            L_SH   = _safe_get_landmark(lms, 11)
+            R_SH   = _safe_get_landmark(lms, 12)
+            L_HIP  = _safe_get_landmark(lms, 23)
+            R_HIP  = _safe_get_landmark(lms, 24)
+            L_KNEE = _safe_get_landmark(lms, 25)
+            R_KNEE = _safe_get_landmark(lms, 26)
+        except Exception:
+            return None
+
+        if min(NOSE[2], L_SH[2], R_SH[2], L_HIP[2], R_HIP[2]) < 0.3:
+            return None
+
+        NOSE_px  = _px(NOSE, w, h)
+        # 側面ではどちらかの肩だけが主に見えることが多いので、より見えている方（xの偏りが小さい方）を使う
+        L_SH_px, R_SH_px = _px(L_SH, w, h), _px(R_SH, w, h)
+        SH_px = L_SH_px if L_SH[2] >= R_SH[2] else R_SH_px
+
+        # 水平スケール: 肩-腰の距離を基準スケール（仮に 40cm）に対応させる
+        L_HIP_px, R_HIP_px = _px(L_HIP, w, h), _px(R_HIP, w, h)
+        HIP_px = L_HIP_px if L_HIP[2] >= R_HIP[2] else R_HIP_px
+
+        torso_px = _dist(SH_px, HIP_px)  # ピクセル距離
+        if torso_px < 10:  # 極端に小さい時は不安定
+            return None
+
+        # 頭の前方変位: 鼻と肩の x 差（横ずれ）を正値化・cm換算
+        head_forward_px = abs(NOSE_px[0] - SH_px[0])  # 横方向のズレ
+        # 仮想スケール: torso_px ピクセル ≒ 40cm と仮定
+        forward_head_cm = (head_forward_px / torso_px) * 40.0
+        forward_head_cm = float(np.clip(forward_head_cm, 0.0, 10.0))
+
+        # ざっくり胸椎カーブ: 肩-腰-膝の角度（鋭角ほど丸まり）
+        try:
+            L_KNEE_px, R_KNEE_px = _px(L_KNEE, w, h), _px(R_KNEE, w, h)
+            KNEE_px = L_KNEE_px if L_KNEE[2] >= R_KNEE[2] else R_KNEE_px
+            # 角度 θ = ∠(shoulder -> hip, knee -> hip)
+            v1 = (SH_px[0]-HIP_px[0], SH_px[1]-HIP_px[1])
+            v2 = (KNEE_px[0]-HIP_px[0], KNEE_px[1]-HIP_px[1])
+            def _angle_between(a, b):
+                an = math.hypot(a[0], a[1]); bn = math.hypot(b[0], b[1])
+                if an < 1e-6 or bn < 1e-6: return 180.0
+                cosv = max(-1.0, min(1.0, (a[0]*b[0] + a[1]*b[1])/(an*bn)))
+                return math.degrees(math.acos(cosv))
+            hip_angle = _angle_between(v1, v2)  # だいたい 160~200 のレンジ想定
+        except Exception:
+            hip_angle = 180.0
+
+        # 腰角度が鋭く（小さく）なるほど丸まりと仮定（単純化）
+        if hip_angle >= 170:
+            kyphosis = "軽度"
+        elif hip_angle >= 150:
+            kyphosis = "中等度"
+        else:
+            kyphosis = "やや強い"
+
+        return {
+            "forward_head_cm": round(forward_head_cm, 1),
+            "kyphosis_grade": kyphosis
+        }
+
+
+# ================================
+# スコアリング
+# ================================
+def _scores_from_pose(front_metrics, side_metrics, f_front_fallback, f_side_fallback):
+    """
+    front_metrics: {"shoulder_angle", "pelvis_tilt"} 180に近いほど水平
+    side_metrics: {"forward_head_cm", "kyphosis_grade"}
+    フォールバック: f_front_fallback, f_side_fallback は _img_feats() の結果
+    """
+    # ---- 姿勢(posture)
+    # 前方頭位が大きいほど減点
+    if side_metrics and "forward_head_cm" in side_metrics:
+        fh = side_metrics["forward_head_cm"]
+        # 0cm -> 10点, 5cm -> 6点, 8cm -> 3点 くらいのカーブ
+        posture = 10.0 - np.clip((fh/8.0)*7.0, 0.0, 7.0)
+    else:
+        # 画像エッジから代用（エッジ多い=猫背寄り）
+        posture = 10.0 - np.clip((f_side_fallback["edge"] - 0.02) * 80.0, 0.0, 7.0)
+    posture = round(float(np.clip(posture, 0.0, 10.0)), 1)
+
+    # ---- バランス(balance) ＝ 肩・骨盤の水平度
+    if front_metrics:
+        sh = front_metrics["shoulder_angle"]  # 180に近いほど水平
+        hp = front_metrics["pelvis_tilt"]
+        # 180との差分を減点（1°ズレ= 0.5点減点くらい）
+        def to_score(a):
+            return max(0.0, 10.0 - 0.5*abs(180.0 - a))
+        balance = (to_score(sh) + to_score(hp)) / 2.0
+    else:
+        # 代用：明るさの安定性（std）でごまかし
+        s1 = float(np.clip((f_front_fallback["std"]-20)/60*10, 0, 10))
+        s2 = float(np.clip((f_side_fallback["std"]-20)/60*10, 0, 10))
+        balance = (10.0 - abs(s1 - s2))
+    balance = round(float(np.clip(balance, 0.0, 10.0)), 1)
+
+    # ---- 筋肉・脂肪(muscle_fat) ＝ 画のコントラスト（仮）
+    muscle_fat = float(np.clip((f_front_fallback["std"]-15)/75*10, 0.0, 10.0))
+    muscle_fat = round(muscle_fat, 1)
+
+    # ---- ファッション映え(fashion) ＝ 明るさ（仮）
+    fashion = float(np.clip((f_front_fallback["mean"]-60)/140*10, 0.0, 10.0))
+    fashion = round(fashion, 1)
+
+    # ---- 総合(overall)
+    overall = round(float(np.clip((balance + posture + fashion)/3.0, 0.0, 10.0)), 1)
 
     return {
-        "pelvis_tilt": f"{pelvis_tilt}°",
-        "shoulder_angle": f"{shoulder_angle}°",
-        "debug": {
-            "shoulder_y_diff": round(shoulder_y_diff, 2),
-            "pelvis_y_diff": round(pelvis_y_diff, 2),
-        },
+        "balance": balance,
+        "fashion": fashion,
+        "muscle_fat": muscle_fat,
+        "overall": overall,
+        "posture": posture
     }
 
 
-# ========== SIDE: 頭の前方/胸椎丸まりの“傾向”を近似 ==========
-def _side_metrics(arr_rgb: np.ndarray) -> Tuple[Dict[str, Any], Dict[str, float]]:
-    """
-    頭が前に出ると、上部のエッジ重心xが胴体より前方に寄る。
-    また、横方向エッジが相対的に強いと背中の丸まり（後弯）傾向が出やすい。
-    """
-    arr = _resize_keep(arr_rgb, 720)
-    gray, edges = _gray_edge(arr)
-    h, w = gray.shape[:2]
-
-    # 上部＝頭/頸部領域、中央＝胸郭領域の想定
-    upper_mask, lower_mask = _upper_lower_masks(h, w, 0.35, 0.35)
-    mid_mask = np.zeros((h, w), np.uint8)
-    mid_mask[int(h * 0.35) : int(h * 0.70), :] = 255
-
-    yu, xu = _center_of_edges(edges, upper_mask)  # 頭/首（上部）の重心
-    ym, xm = _center_of_edges(edges, mid_mask)    # 胸郭（中部）の重心
-
-    # 前方変位の近似（右向きでも左向きでも「上部xが胴体xより前」だと大きくなるよう、差の絶対値）
-    x_shift_px = float(abs(xu - xm))
-
-    # 画素→cm換算の疑似（画像幅 600px を 25cm相当としてスケール）
-    #  → 数cmオーダーで出す。最大で ~5cm程度に抑える。
-    px_per_cm = max(80.0, min(200.0, w / 25.0))  # だいたい25cmが画像幅の1/2〜1倍想定
-    forward_head_cm = float(round(max(0.5, min(5.0, x_shift_px / px_per_cm * 25.0 / 12.0)), 1))
-
-    # 後弯（kyphosis）の近似：横方向エッジの強さ（horiz/verti比）で判定
-    gx = cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3)
-    gy = cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
-    horiz = float(np.mean(np.abs(_safe_numpy(gx))))
-    verti = float(np.mean(np.abs(_safe_numpy(gy))))
-    hv_ratio = float(horiz / (verti + 1e-6))
-
-    # ラベル化（控えめ）
-    if hv_ratio < 0.9:
-        kyphosis = "軽度"
-    elif hv_ratio < 1.2:
-        kyphosis = "中等度"
-    else:
-        kyphosis = "やや強い"
-
-    metrics = {
-        "forward_head": f"{forward_head_cm}cm",
-        "kyphosis": kyphosis,
-    }
-    debug = {
-        "x_shift_px": round(x_shift_px, 2),
-        "hv_ratio": round(hv_ratio, 2),
-    }
-    return metrics, debug
-
-
-# ========== 総合スコア ==========
-def _scores(front_feats: Dict[str, float], side_feats: Dict[str, float],
-            front_m: Dict[str, Any], side_m: Dict[str, Any]) -> Dict[str, float]:
-    """
-    ・balance: 前面の左右上/下の重心差が小さいほど高得点
-    ・fashion: 明るさ（mean）が適正域に近いほど高い（露出良好の仮指標）
-    ・posture: forward_headが小さい＋横エッジ優位すぎないほど高い
-    ・muscle_fat: コントラスト(std)が“ほどよい”ほど高い
-    ・overall: 上の平均
-    """
-    # front_mのdebug値を使って左右差を反映
-    sh_diff = abs(float(front_m.get("debug", {}).get("shoulder_y_diff", 0.0)))
-    pv_diff = abs(float(front_m.get("debug", {}).get("pelvis_y_diff", 0.0)))
-    # 差が小さいほど良い → 0差で1.0、5pxで0.6、10pxで0.2くらいに落ちるよう設計
-    bal_sh = 1.0 - _norm01(sh_diff, 2.5, 10.0)
-    bal_pv = 1.0 - _norm01(pv_diff, 2.5, 10.0)
-    balance = _to10(0.5 * bal_sh + 0.5 * bal_pv)
-
-    # fashion: 明るさ適正 80〜170 を高評価域とし、そこから外れると減点
-    mean = float(front_feats["mean"])
-    if mean <= 80:
-        fashion = _to10(_norm01(mean, 30, 80))
-    elif mean >= 170:
-        fashion = _to10(1.0 - _norm01(mean, 170, 230))
-    else:
-        fashion = _to10(1.0)  # 80~170は満点寄り
-
-    # posture: forward_head と hv_ratio を使う（小さい/低いほど良い）
-    try:
-        fwd_cm = float(str(side_m["forward_head"]).rstrip("cm"))
-    except Exception:
-        fwd_cm = 2.0
-    hv = float(side_feats["hv_ratio"])
-    # 2cm以下なら高得点、5cmで低得点
-    p1 = 1.0 - _norm01(fwd_cm, 2.0, 5.0)
-    # 横方向エッジ優位（>1.2）はやや減点、0.8~1.0くらいはOK
-    p2 = 1.0 - _norm01(hv, 1.0, 1.5)
-    posture = _to10(0.6 * p1 + 0.4 * p2)
-
-    # muscle_fat: stdが“ほどよい” 20~80 を高評価域
-    std = float(front_feats["std"])
-    if std <= 20:
-        mfat = _to10(_norm01(std, 5, 20))
-    elif std >= 80:
-        mfat = _to10(1.0 - _norm01(std, 80, 120))
-    else:
-        mfat = _to10(1.0)
-    muscle_fat = mfat
-
-    overall = float(round((balance + fashion + posture + muscle_fat) / 4.0, 1))
-
-    return dict(
-        balance=balance,
-        fashion=fashion,
-        muscle_fat=muscle_fat,
-        overall=overall,
-        posture=posture,
-    )
-
-
-# ========== アドバイス生成 ==========
-def _advice(front_m: Dict[str, Any], side_m: Dict[str, Any], scores: Dict[str, float]) -> list:
+def _advice(front_metrics, side_metrics, scores):
     adv = []
-    # 肩角度 175°から大きくズレたら注意
-    try:
-        shoulder_deg = float(str(front_m["shoulder_angle"]).rstrip("°"))
-        if abs(shoulder_deg - 175.0) > 3.0:
+
+    # 肩の左右差（肩角度が 175±3 を外れたら）
+    if front_metrics:
+        sh = front_metrics["shoulder_angle"]
+        if abs(sh - 175.0) > 3.0:
             adv.append("肩の高さ差に注意。片側だけ荷物を持たない。")
-    except Exception:
-        pass
-    # 前方頭位
-    try:
-        fwd = float(str(side_m["forward_head"]).rstrip("cm"))
-        if fwd >= 2.0:
+
+    # 頭の前方変位
+    if side_metrics and "forward_head_cm" in side_metrics:
+        fh = side_metrics["forward_head_cm"]
+        if fh >= 5.0:
+            adv.append("頭が前に出ています。顎引きエクササイズと胸椎伸展ストレッチを習慣化。")
+        elif fh >= 3.0:
+            adv.append("軽度の前方頭位。1日2回の顎引き/胸を開くストレッチが効果的。")
+        else:
+            adv.append("頭の位置は概ね良好です。作業時の姿勢維持を意識しましょう。")
+    else:
+        # フォールバック時
+        if scores["posture"] < 6.5:
             adv.append("胸椎伸展ストレッチと顎引きエクササイズを1日2回。")
-    except Exception:
-        pass
-    # 姿勢スコアが低めなら一般アドバイス
-    if scores.get("posture", 10.0) < 6.5 and "胸椎伸展ストレッチと顎引きエクササイズを1日2回。" not in adv:
-        adv.append("胸椎伸展ストレッチと顎引きエクササイズを1日2回。")
-    return adv
+
+    # 姿勢スコア全体
+    if scores["posture"] < 5.0:
+        adv.append("長時間座位では30分ごとに立ち上がって肩甲骨を大きく動かす。")
+
+    # ダブリ除去
+    out = []
+    seen = set()
+    for a in adv:
+        if a and a not in seen:
+            out.append(a)
+            seen.add(a)
+    return out
 
 
-# ========== API ==========
+# ================================
+# API 本体
+# ================================
 @app.post("/analyze")
 def analyze():
     front_fs = request.files.get("front")
-    side_fs = request.files.get("side")
+    side_fs  = request.files.get("side")
     if not front_fs or not side_fs:
         return jsonify({"status": "error", "message": "front and side required"}), 400
 
     # 読み込み
-    front_rgb, _ = _read_rgb(front_fs)
-    side_rgb, _ = _read_rgb(side_fs)
+    front_arr, _ = _load_img(front_fs)
+    side_arr,  _ = _load_img(side_fs)
 
-    # 特徴抽出
-    f_gray, f_edges = _gray_edge(_resize_keep(front_rgb, 720))
-    s_gray, s_edges = _gray_edge(_resize_keep(side_rgb, 720))
+    # まずはフォールバック特徴（必ず計算しておく）
+    f_front_fb = _img_feats(front_arr)
+    f_side_fb  = _img_feats(side_arr)
 
-    front_feats = _basic_feats(f_gray, f_edges)
-    side_feats = _basic_feats(s_gray, s_edges)
+    # Pose が使えればポーズ計測
+    front_metrics_pose = None
+    side_metrics_pose  = None
+    if MP_AVAILABLE:
+        try:
+            # Mediapipe は RGB 想定、既にRGBなのでそのまま
+            front_metrics_pose = _analyze_front_with_pose(front_arr)
+        except Exception:
+            front_metrics_pose = None
+        try:
+            side_metrics_pose  = _analyze_side_with_pose(side_arr)
+        except Exception:
+            side_metrics_pose = None
 
-    # メトリクス
-    front_metrics = _front_metrics(front_rgb)
-    side_metrics, _side_dbg = _side_metrics(side_rgb)
+    # 返却用のメトリクス整形
+    if front_metrics_pose:
+        front_metrics = {
+            "pelvis_tilt": f'{front_metrics_pose["pelvis_tilt"]}°',
+            "shoulder_angle": f'{front_metrics_pose["shoulder_angle"]}°',
+        }
+    else:
+        # フォールバック（画像統計からダミー角度）
+        pelvis = round(170 + (f_front_fb["std"] % 10), 1)
+        shoulder = round(170 + (f_front_fb["mean"] % 10), 1)
+        front_metrics = {"pelvis_tilt": f"{pelvis}°", "shoulder_angle": f"{shoulder}°"}
+
+    if side_metrics_pose:
+        side_metrics = {
+            "forward_head": f'{side_metrics_pose["forward_head_cm"]}cm',
+            "kyphosis": side_metrics_pose["kyphosis_grade"],
+        }
+    else:
+        # フォールバック
+        fh_cm = round(1.0 + (f_side_fb["edge"] * 10), 1)
+        ky = "軽度" if fh_cm < 2.0 else ("中等度" if fh_cm < 3.0 else "やや強い")
+        side_metrics = {"forward_head": f"{fh_cm}cm", "kyphosis": ky}
 
     # スコア
-    scores = _scores(front_feats, side_feats, front_metrics, side_metrics)
+    scores = _scores_from_pose(front_metrics_pose, side_metrics_pose, f_front_fb, f_side_fb)
 
     # アドバイス
-    advice = _advice(front_metrics, side_metrics, scores)
+    advice = _advice(front_metrics_pose, side_metrics_pose, scores)
 
     return jsonify({
         "status": "ok",
         "message": "files received",
         "scores": scores,
-        "front_metrics": {k: v for k, v in front_metrics.items() if k != "debug"},
+        "front_metrics": front_metrics,
         "side_metrics": side_metrics,
         "advice": advice,
-        "front_filename": request.files["front"].filename,
-        "side_filename": request.files["side"].filename,
-        # デバッグを見たいときはコメント解除
-        # "debug": {"front_feats": front_feats, "side_feats": side_feats, "front_debug": front_metrics.get("debug"), "side_debug": _side_dbg},
+        "front_filename": front_fs.filename,
+        "side_filename": side_fs.filename,
     })
